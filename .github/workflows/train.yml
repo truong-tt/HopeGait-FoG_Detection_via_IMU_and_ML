@@ -1,0 +1,85 @@
+name: Train (manual)
+
+# GitHub-hosted runners do NOT have GPUs; running real LOSO training here will
+# be slow and may time out (6-hour limit). This workflow is most useful on a
+# self-hosted GPU runner. Kick it off via the Actions tab.
+#
+# To wire up a self-hosted GPU runner:
+#   Settings -> Actions -> Runners -> New self-hosted runner
+#   Then on your GPU box: ./config.sh ... ; ./run.sh
+#   The 'self-hosted' label below picks it up.
+
+on:
+  workflow_dispatch:
+    inputs:
+      runner:
+        description: 'Runner label: "ubuntu-latest" (CPU smoke), "self-hosted" (GPU).'
+        required: true
+        default: 'ubuntu-latest'
+        type: choice
+        options:
+          - ubuntu-latest
+          - self-hosted
+      window:
+        description: 'Window size to train (e.g. 200). Empty = all configured.'
+        required: false
+        default: ''
+      epochs:
+        description: 'Override epoch count (empty = config default).'
+        required: false
+        default: ''
+      data_url:
+        description: 'Optional URL to a tarball of preprocessed data (data/processed/).'
+        required: false
+        default: ''
+
+jobs:
+  train:
+    runs-on: ${{ inputs.runner }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: pip
+
+      - name: Install deps
+        run: |
+          pip install --upgrade pip
+          pip install -r requirements.txt
+          # If the runner is GPU-equipped, replace the CPU wheel with CUDA.
+          if command -v nvidia-smi >/dev/null 2>&1; then
+            pip install torch --index-url https://download.pytorch.org/whl/cu121 --upgrade
+          fi
+
+      - name: Fetch processed data (optional)
+        if: ${{ inputs.data_url != '' }}
+        run: |
+          mkdir -p data
+          curl -L "${{ inputs.data_url }}" -o data.tar.gz
+          tar -xzf data.tar.gz
+          ls -la data/processed || true
+
+      - name: Smoke test (no real data)
+        if: ${{ inputs.data_url == '' }}
+        run: python scripts/smoke_train.py
+
+      - name: Train
+        if: ${{ inputs.data_url != '' }}
+        env:
+          HOPEGAIT_EPOCHS: ${{ inputs.epochs }}
+        run: |
+          ARGS=""
+          if [ -n "${{ inputs.window }}" ]; then ARGS="$ARGS --window ${{ inputs.window }}"; fi
+          python src/training/train.py $ARGS
+          python src/training/evaluate.py
+
+      - name: Upload model checkpoints
+        if: ${{ inputs.data_url != '' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: hopegait-models-${{ github.run_id }}
+          path: models/
+          retention-days: 14

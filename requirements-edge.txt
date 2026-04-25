@@ -1,0 +1,12 @@
+# Edge-conversion deps. Install on top of requirements.txt only when running
+# the quantize/export pipeline. The PyTorch -> TF path is being rebuilt with
+# `ai-edge-torch`; keep the legacy ONNX path pinned in case it's still needed.
+
+# New path:
+ai-edge-torch>=0.2.0
+
+# Legacy path (pin together; protobuf must match TF's expected version):
+tensorflow==2.15.0
+onnx>=1.15
+onnx-tf>=1.10
+protobuf>=3.20.3,<5
