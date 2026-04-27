@@ -26,21 +26,29 @@ FoG — sudden gait arrest mid-step — is a hallmark Parkinson's symptom and a 
 9. [Cloud and Docker Runs](#9-cloud-and-docker-runs)
 10. [Evaluation and Tests](#10-evaluation-and-tests)
 11. [Next Steps](#11-next-steps)
-12. [Data and Credit](#data-and-credit)
-13. [License](#license)
+12. [References](#12-references)
+13. [Data and Credit](#data-and-credit)
+14. [License](#license)
 
 ---
 
 ## 1. System Architecture
 
-| Step | Module | Operation |
-|------|--------|-----------|
-| 1 | `data_pipeline/preprocess.py` | Resample → bandpass filter → gravity split → windowing |
-| 2 | `data_pipeline/dsp.py` + `dataset.py` | 9-channel windows → LOSO subject splits → augmentation |
-| 3 | `models/tcn_model.py` | Causal TCN — last-step head + dense auxiliary head |
-| 4 | `training/train.py` + `evaluate.py` | Focal loss + AdamW + EMA + MCC-based model selection |
-| 5 | `inference/postprocess.py` | Causal smoothing + hysteresis trigger |
-| 6 | `edge_conversion/quantize_model.py` | Quantization + export for edge deployment |
+End-to-end pipeline from raw IMU samples to a quantized model artifact ready for microcontroller deployment.
+
+```mermaid
+flowchart TD
+    A["Raw IMU<br/>100 Hz, 6-axis"]
+    B["1. Preprocess<br/>data_pipeline/preprocess.py<br/>resample, bandpass, gravity split, windowing"]
+    C["2. Windowing and Splits<br/>dataset.py + dsp.py<br/>9-channel windows, LOSO splits, augmentation"]
+    D["3. Causal TCN<br/>models/tcn_model.py<br/>last-step head + dense auxiliary head"]
+    E["4. Train and Select<br/>training/train.py + evaluate.py<br/>focal loss, AdamW, EMA, MCC selection"]
+    F["5. Post-process<br/>inference/postprocess.py<br/>causal smoothing, hysteresis"]
+    G["6. Quantize and Export<br/>edge_conversion/quantize_model.py<br/>int8 artifact for MCU"]
+    A --> B --> C --> D --> E --> F --> G
+```
+
+Each downstream stage is causal — outputs at time `t` depend only on samples up to `t`, so the offline training graph mirrors the live streaming graph on-device.
 
 ---
 
@@ -59,11 +67,19 @@ FoG — sudden gait arrest mid-step — is a hallmark Parkinson's symptom and a 
 
 ### 3.1 Why a causal TCN
 
+A causal Temporal Convolutional Network is a strong fit for streaming IMU classification:
+
 | Property | Detail |
 |---|---|
 | Receptive field | Large, via dilated convolutions — low compute cost |
 | Causality | Output at step `t` never depends on future samples |
 | Deployment fit | Viable for streaming inference and MCU export |
+
+The backbone is augmented with three streaming-friendly building blocks:
+
+- **Per-timestep Layer Normalization** — replaces BatchNorm so the network is strictly causal and behaves identically at batch size 1 (live inference) and during quantization-aware training.
+- **Causal Squeeze-and-Excitation Networks** — channel reweighting using a *cumulative* mean across time, so the dense head stays causal.
+- **Deep Networks with Stochastic Depth** on residual branches — regularizes the deep stack without adding inference cost.
 
 ### 3.2 Heads and losses
 
@@ -72,16 +88,16 @@ FoG — sudden gait arrest mid-step — is a hallmark Parkinson's symptom and a 
 | Last-step head | Real-time deployment inference |
 | Dense per-timestep head | Auxiliary training supervision — stronger gradient signal |
 
-Both heads use focal loss to handle class imbalance. Total loss = last-step loss + (`dense_loss_weight` × dense loss). `dense_loss_weight` is set in `config.py`.
+Both heads use Focal Loss for Dense Object Detection to handle class imbalance. Total loss = last-step loss + (`dense_loss_weight` × dense loss). `dense_loss_weight` is set in `config.py`.
 
 ### 3.3 Optimization
 
 | Setting | Value |
 |---|---|
-| Optimizer | AdamW |
+| Optimizer | Decoupled Weight Decay Regularization (AdamW)
 | Mixed precision | Enabled on CUDA (optional) |
-| EMA shadow weights | Used for validation and checkpoint selection |
-| Best epoch criterion | MCC on inner validation subject |
+| EMA shadow weights | EMA copy of weights used for validation and checkpoint selection |
+| Best epoch criterion | Matthews Correlation Coefficient (MCC) on inner validation subject |
 
 ---
 
@@ -248,7 +264,7 @@ Only needed when running `edge_conversion/quantize_model.py`. Install on top of 
 pip install -r requirements-edge.txt
 ```
 
-Includes `ai-edge-torch>=0.2.0` (primary path) and the legacy ONNX/TF stack (`tensorflow==2.15.0`, `onnx>=1.15`, `onnx-tf>=1.10`, `protobuf>=3.20.3,<5`). Do not install edge deps into the same environment used for cloud training — protobuf and TF version conflicts will break the PyTorch stack.
+Includes `ai-edge-torch>=0.2.0` (primary path) and the legacy ONNX/TF stack (`tensorflow==2.15.0`, `onnx>=1.15`, `onnx-tf>=1.10`, `protobuf>=3.20.3,<5`). Both targets produce int8 TFLite using the integer-arithmetic-only quantization scheme of [Quantization and Training of Neural Networks for Efficient Integer-Arithmetic-Only Inference](https://arxiv.org/abs/1712.05877). Do not install edge deps into the same environment used for cloud training — protobuf and TF version conflicts will break the PyTorch stack.
 
 ### Smoke test (no GPU, no data required)
 
@@ -325,6 +341,32 @@ Three operating points reported per fold: fixed-threshold, fold-optimized thresh
 - Complete edge path with robust int8 conversion flow via `ai-edge-torch`.
 - Add streaming parity checks between offline and deployed inference.
 - Benchmark latency, memory footprint, and compute on target MCU.
+
+---
+
+## 12. References
+
+**Models and training**
+
+- [An Empirical Evaluation of Generic Convolutional and Recurrent Networks for Sequence Modeling](https://arxiv.org/abs/1803.01271) — Bai, Kolter, & Koltun, 2018. TCN architecture with dilated causal convolutions.
+- [Squeeze-and-Excitation Networks](https://arxiv.org/abs/1709.01507) — Hu, Shen, & Sun, *CVPR* 2018. Channel attention; here adapted to a causal cumulative-mean form.
+- [Layer Normalization](https://arxiv.org/abs/1607.06450) — Ba, Kiros, & Hinton, 2016. Per-timestep normalization friendly to streaming inference and batch-1 QAT.
+- [Deep Networks with Stochastic Depth](https://arxiv.org/abs/1603.09382) — Huang, Sun, Liu, Sedra, & Weinberger, *ECCV* 2016. Residual-branch dropout used during training.
+- [Focal Loss for Dense Object Detection](https://arxiv.org/abs/1708.02002) — Lin, Goyal, Girshick, He, & Dollár, *ICCV* 2017. Class-imbalance loss for FoG vs. non-FoG.
+- [Decoupled Weight Decay Regularization](https://arxiv.org/abs/1711.05101) — Loshchilov & Hutter, *ICLR* 2019. AdamW optimizer.
+- [Mean teachers are better role models](https://arxiv.org/abs/1703.01780) — Tarvainen & Valpola, *NeurIPS* 2017. Modern application of an EMA-of-weights copy for inference and validation.
+
+**Evaluation**
+
+- [The advantages of the Matthews correlation coefficient (MCC) over F1 score and accuracy in binary classification evaluation](https://doi.org/10.1186/s12864-019-6413-7) — Chicco & Jurman, *BMC Genomics* 21(6), 2020. Empirical case for MCC on imbalanced binary tasks.
+
+**Edge deployment**
+
+- [Quantization and Training of Neural Networks for Efficient Integer-Arithmetic-Only Inference](https://arxiv.org/abs/1712.05877) — Jacob et al., *CVPR* 2018. int8 quantization scheme used by TFLite.
+
+**Dataset**
+
+- [Stanford NMBL IMU FoG Detection Repository](https://github.com/stanfordnmbl/imu-fog-detection) — raw IMU recordings used for training and LOSO evaluation.
 
 ---
 
