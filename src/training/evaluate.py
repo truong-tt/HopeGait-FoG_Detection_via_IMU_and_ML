@@ -8,6 +8,12 @@ Reports three operating points:
   - @post-processed: per-recording smoothing + hysteresis around the
     fold-Youden threshold. This is the number that approximates what the
     cueing belt would actually deliver.
+
+Sample-level metrics (sensitivity, specificity, F1, MCC, PR-AUC, ROC-AUC)
+report per-prediction performance. Event-level metrics — episode detection
+rate, detection latency, and false alarms per hour — describe what the
+patient actually experiences from the cueing belt: did it catch each
+freezing episode and how often did it cry wolf during normal walking.
 """
 
 import os
@@ -25,7 +31,8 @@ if SRC_DIR not in sys.path:
 
 from config import (WINDOW_SIZES, PROCESSED_DATA_DIR, MODELS_DIR, BATCH_SIZE,
                     NUM_CHANNELS, KERNEL_SIZE, DROPOUT, NUM_INPUTS, NUM_CLASSES, SEED,
-                    DROP_PATH, USE_SE, SMOOTH_WINDOW, HYSTERESIS_LOW, HYSTERESIS_HIGH)
+                    DROP_PATH, USE_SE, SMOOTH_WINDOW, HYSTERESIS_LOW, HYSTERESIS_HIGH,
+                    SAMPLING_RATE, WINDOW_OVERLAP)
 from data_pipeline.dataset import create_loso_dataloaders, get_all_subjects
 from data_pipeline.dsp import RobustScaler
 from models.tcn_model import HopeGaitTCN
@@ -64,6 +71,100 @@ def _metrics_from_preds(targets, preds, threshold):
 def _metrics_at_threshold(targets, probs, thr):
     preds = (probs >= thr).astype(np.int64)
     return _metrics_from_preds(targets, preds, thr)
+
+
+def _find_runs(arr, value):
+    """Indices of contiguous runs of `value` in 1-D array. Returns list of
+    (start, end) inclusive index pairs.
+    """
+    arr = np.asarray(arr).astype(np.int64)
+    runs = []
+    n = len(arr)
+    i = 0
+    while i < n:
+        if arr[i] == value:
+            j = i
+            while j < n and arr[j] == value:
+                j += 1
+            runs.append((i, j - 1))
+            i = j
+        else:
+            i += 1
+    return runs
+
+
+def event_level_metrics(targets, preds, prediction_rate_hz=1.0):
+    """Episode-level metrics for streaming FoG detection.
+
+    Each contiguous run of 1s in `targets` is one FoG episode. An episode
+    counts as detected if any positive prediction lands inside [start, end];
+    detection latency is the index of the first such positive divided by
+    `prediction_rate_hz`. A predicted run not overlapping any target episode
+    is a false alarm, normalized to alarms per non-FoG hour.
+
+    Returned dict keys: `n_episodes`, `episode_detection_rate`,
+    `mean_detection_latency_s`, `median_detection_latency_s`, `false_alarms`,
+    `false_alarms_per_hour`.
+    """
+    targets = np.asarray(targets).astype(np.int64)
+    preds = np.asarray(preds).astype(np.int64)
+    n = len(targets)
+    if n == 0 or len(preds) != n:
+        return {
+            'n_episodes': 0,
+            'episode_detection_rate': 0.0,
+            'mean_detection_latency_s': None,
+            'median_detection_latency_s': None,
+            'false_alarms': 0,
+            'false_alarms_per_hour': None,
+        }
+
+    target_episodes = _find_runs(targets, 1)
+    pred_alarms = _find_runs(preds, 1)
+
+    detected = 0
+    latencies = []
+    for start, end in target_episodes:
+        # First positive prediction inside the episode counts as detection.
+        # Any positive *before* the episode start is a false alarm, not a
+        # detection — we only look in [start, end].
+        slice_preds = preds[start:end + 1]
+        hits = np.where(slice_preds == 1)[0]
+        if hits.size > 0:
+            detected += 1
+            latencies.append(int(hits[0]))
+
+    false_alarms = 0
+    for ps, pe in pred_alarms:
+        # Overlap = not (pe < target_start OR ps > target_end). Check all
+        # target episodes; a pred run overlapping any target is not an alarm.
+        overlapped = any(not (pe < ts or ps > te) for ts, te in target_episodes)
+        if not overlapped:
+            false_alarms += 1
+
+    n_episodes = len(target_episodes)
+    detection_rate = detected / n_episodes if n_episodes > 0 else 0.0
+    mean_lat_s = float(np.mean(latencies)) / prediction_rate_hz if latencies else None
+    median_lat_s = float(np.median(latencies)) / prediction_rate_hz if latencies else None
+
+    non_fog_samples = int((targets == 0).sum())
+    non_fog_hours = non_fog_samples / prediction_rate_hz / 3600.0
+    fa_per_hour = false_alarms / non_fog_hours if non_fog_hours > 0 else None
+
+    return {
+        'n_episodes': int(n_episodes),
+        'episode_detection_rate': float(detection_rate),
+        'mean_detection_latency_s': mean_lat_s,
+        'median_detection_latency_s': median_lat_s,
+        'false_alarms': int(false_alarms),
+        'false_alarms_per_hour': fa_per_hour,
+    }
+
+
+def _prediction_rate_hz(seq_length):
+    """Predictions arrive at fs / step where step = window * (1 - overlap)."""
+    step_samples = max(1, int(seq_length * (1.0 - WINDOW_OVERLAP)))
+    return float(SAMPLING_RATE) / step_samples
 
 
 def _load_fold_threshold(meta_path, fallback=0.5):
@@ -110,6 +211,7 @@ def evaluate_window(seq_length):
     pp_preds_all, pp_targets_all = [], []
 
     band = max(0.0, HYSTERESIS_HIGH - HYSTERESIS_LOW)
+    pred_rate_hz = _prediction_rate_hz(seq_length)
 
     for subj in subjects:
         r = evaluate_fold(subj, seq_length)
@@ -128,7 +230,15 @@ def evaluate_window(seq_length):
             hysteresis_band=band)
         pp = _metrics_from_preds(targets, pp_preds, fold_thr)
 
-        per_subject[subj] = {'at_fold_threshold': raw, 'at_postprocessed': pp}
+        # Event-level: each subject's predictions form a single stream so
+        # episodes are detected per-subject (no cross-subject episode bleeds).
+        events_pp = event_level_metrics(targets, pp_preds, prediction_rate_hz=pred_rate_hz)
+
+        per_subject[subj] = {
+            'at_fold_threshold': raw,
+            'at_postprocessed': pp,
+            'events_at_postprocessed': events_pp,
+        }
         agg_targets.append(targets)
         agg_probs.append(probs)
         pp_preds_all.append(pp_preds)
@@ -147,11 +257,17 @@ def evaluate_window(seq_length):
     pr_auc = float(average_precision_score(t, p)) if len(np.unique(t)) > 1 else 0.0
     roc_auc = float(roc_auc_score(t, p)) if len(np.unique(t)) > 1 else 0.0
 
+    # Aggregate event-level metrics across all subjects' post-processed streams.
+    events_agg = event_level_metrics(pp_targets_cat, pp_preds_cat,
+                                     prediction_rate_hz=pred_rate_hz)
+
     return {
         'window': seq_length,
         'n_subjects': len(per_subject),
+        'prediction_rate_hz': pred_rate_hz,
         'at_0.5': at_05,
         'at_postprocessed': at_pp,
+        'events_at_postprocessed': events_agg,
         'pr_auc': pr_auc,
         'roc_auc': roc_auc,
         'smooth_window': SMOOTH_WINDOW,
@@ -162,7 +278,8 @@ def evaluate_window(seq_length):
 
 def _print_summary(r):
     w = r['window']
-    print(f"\n=== Window {w} ({r['n_subjects']} subjects) ===")
+    print(f"\n=== Window {w} ({r['n_subjects']} subjects, "
+          f"prediction_rate={r['prediction_rate_hz']:.2f} Hz) ===")
     a = r['at_0.5']
     print(f"  @0.5      sens={a['sensitivity']*100:5.1f}%  spec={a['specificity']*100:5.1f}%  "
           f"F1={a['f1']:.3f}  MCC={a['mcc']:+.3f}")
@@ -170,6 +287,11 @@ def _print_summary(r):
     print(f"  @post-pp  sens={b['sensitivity']*100:5.1f}%  spec={b['specificity']*100:5.1f}%  "
           f"F1={b['f1']:.3f}  MCC={b['mcc']:+.3f}  (smooth={r['smooth_window']}, band={r['hysteresis_band']:.2f})")
     print(f"  PR-AUC={r['pr_auc']:.3f}  ROC-AUC={r['roc_auc']:.3f}")
+    e = r['events_at_postprocessed']
+    mean_lat = f"{e['mean_detection_latency_s']:.2f} s" if e['mean_detection_latency_s'] is not None else "n/a"
+    fa_hr = f"{e['false_alarms_per_hour']:.2f}" if e['false_alarms_per_hour'] is not None else "n/a"
+    print(f"  events    n_episodes={e['n_episodes']}  detected={e['episode_detection_rate']*100:5.1f}%  "
+          f"mean_latency={mean_lat}  false_alarms/h={fa_hr}")
 
 
 def main():

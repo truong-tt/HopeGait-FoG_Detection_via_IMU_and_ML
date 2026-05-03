@@ -11,6 +11,8 @@ PyYAML>=6.0
 
 # PyTorch — install the appropriate CUDA wheel in cloud Dockerfiles.
 # CPU wheel works for CI smoke tests.
-torch>=2.1
+# >=2.0 covers torch.amp.autocast(device_type=...) and torch.cuda.amp.GradScaler,
+# the AMP forms training/train.py uses.
+torch>=2.0
 
 pytest>=7.0

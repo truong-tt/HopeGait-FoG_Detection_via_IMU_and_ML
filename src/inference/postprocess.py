@@ -37,15 +37,13 @@ def smooth_probs(probs: np.ndarray, window: int = 5) -> np.ndarray:
 
 def apply_hysteresis(probs: np.ndarray, low: float = 0.4, high: float = 0.6,
                      initial_state: int = 0) -> np.ndarray:
-    """Dual-threshold gate -> binary decisions.
+    """Schmitt-trigger gate over `probs` — enter FREEZE at `high`, leave at `low`.
 
-    Args:
-        probs: 1D array of (already smoothed) probabilities.
-        low: drop below this to leave FREEZE.
-        high: rise to/above this to enter FREEZE.
-        initial_state: state before the first sample (0 = walking, 1 = freeze).
-    Returns:
-        int64 array of the same length, values in {0, 1}.
+    Operates on a 1-D array of (already-smoothed) probabilities and returns
+    int64 binary decisions of the same length. `initial_state` seeds the
+    machine before the first sample (0 = walking, 1 = freeze) — pass the
+    last state of the previous chunk for streaming-style continuity across
+    recording boundaries.
     """
     if not 0.0 <= low <= high <= 1.0:
         raise ValueError(f"Invalid thresholds low={low} high={high}.")

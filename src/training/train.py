@@ -67,7 +67,7 @@ def _train_epoch(model, loader, criterion, optimizer, device, scaler_amp,
         y_last = y_dense[:, -1]
 
         optimizer.zero_grad(set_to_none=True)
-        with torch.amp.autocast('cuda', enabled=use_amp):
+        with torch.amp.autocast(device_type='cuda', enabled=use_amp):
             last_logits, dense_logits = model.forward_dense(x)
             loss_last = criterion(last_logits, y_last)
             loss_dense = criterion(dense_logits, y_dense)
@@ -136,7 +136,7 @@ def train_fold(test_subject, seq_length, args):
         optimizer, mode='max', patience=LR_PATIENCE, factor=0.5)
     class_weights = torch.tensor(CLASS_WEIGHTS, dtype=torch.float32).to(device)
     criterion = FocalLoss(alpha=class_weights, gamma=FOCAL_GAMMA)
-    scaler_amp = torch.amp.GradScaler('cuda', enabled=use_amp)
+    scaler_amp = torch.cuda.amp.GradScaler(enabled=use_amp)
 
     target_dir = os.path.join(MODELS_DIR, f'win_{seq_length}')
     os.makedirs(target_dir, exist_ok=True)

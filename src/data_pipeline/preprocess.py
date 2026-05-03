@@ -1,14 +1,35 @@
 """Segment raw IMU recordings into labeled windows.
 
-Channels (9):
-  0..2  linear_acc  (xyz)
-  3..5  gravity     (xyz)
-  6..8  gyro        (xyz)
+The upstream stanfordnmbl/imu-fog-detection dataset provides 6 raw channels
+per IMU at 128 Hz:
 
-Per-window scalar DSP features (Freeze Index, STFT band power) used to live in the
-input tensor but were broadcast as constants across all timesteps — flat columns
-that wasted model capacity. They're gone. The TCN learns its own frequency cues
-from the linear_acc channels, given the dilated receptive field.
+    ax, ay, az  (accelerometer, m/s^2)
+    gx, gy, gz  (gyroscope,    rad/s)
+
+We resample to FREQ_DESIRED=64 Hz then EXPAND those 6 raw channels into 9
+input channels by splitting accelerometer into linear_acc + gravity via a
+0.3 Hz lowpass (the gravity component is the slow part of acc; subtracting
+it yields motion-only linear_acc). The TCN consumes these 9 channels; the
+expansion is a deliberate inductive bias — it gives the model a clean
+gravity-orientation signal without forcing it to learn the lowpass split:
+
+  In (raw, 6):       ax  ay  az  gx  gy  gz                    @ 128 Hz raw
+  Resample:          ax  ay  az  gx  gy  gz                    @ 64 Hz
+  DSP split:         linear_acc[3] | gravity[3] | gyro[3]      @ 64 Hz
+
+Output channel layout (9):
+  0..2  linear_acc  (xyz, m/s^2, gravity removed)
+  3..5  gravity     (xyz, m/s^2, slow component of acc)
+  6..8  gyro        (xyz, rad/s)
+
+A 2-second window at 64 Hz is 128 samples — matches WINDOW_DUR * FREQ_DESIRED
+in the upstream dataset code.
+
+Per-window scalar DSP features (Freeze Index, STFT band power) used to live
+in the input tensor but were broadcast as constants across all timesteps —
+flat columns that wasted model capacity. They're gone. The TCN learns its
+own frequency cues from the linear_acc channels, given the dilated
+receptive field.
 
 Labels are saved per-timestep (shape (N, T)). Training derives the last-step
 label on the fly when needed (causal real-time head) and uses the full vector

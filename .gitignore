@@ -7,6 +7,7 @@
 !README.md
 !requirements.txt
 !requirements-edge.txt
+!pyproject.toml
 !src/
 !src/**
 !tests/
@@ -16,6 +17,12 @@
 !config/
 !config/**
 !pytest.ini
+!agent/
+!agent/**
+!reports/
+!reports/**
+!models/
+!models/.gitkeep
 
 __pycache__/
 *.pyc

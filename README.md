@@ -38,9 +38,9 @@ End-to-end pipeline from raw IMU samples to a quantized model artifact ready for
 
 ```mermaid
 flowchart TD
-    A["Raw IMU<br/>100 Hz, 6-axis"]
-    B["1. Preprocess<br/>data_pipeline/preprocess.py<br/>resample, bandpass, gravity split, windowing"]
-    C["2. Windowing and Splits<br/>dataset.py + dsp.py<br/>9-channel windows, LOSO splits, augmentation"]
+    A["Raw IMU<br/>128 Hz, 6 channels<br/>(ax, ay, az, gx, gy, gz)"]
+    B["1. Preprocess<br/>data_pipeline/preprocess.py<br/>resample 128→64 Hz, lowpass,<br/>gravity split (acc → linear_acc + gravity), windowing"]
+    C["2. Windowing and Splits<br/>dataset.py + dsp.py<br/>9-channel windows (128 samples = 2 s),<br/>LOSO splits, SO(3) rotation augmentation"]
     D["3. Causal TCN<br/>models/tcn_model.py<br/>last-step head + dense auxiliary head"]
     E["4. Train and Select<br/>training/train.py + evaluate.py<br/>focal loss, AdamW, EMA, MCC selection"]
     F["5. Post-process<br/>inference/postprocess.py<br/>causal smoothing, hysteresis"]
@@ -56,10 +56,14 @@ Each downstream stage is causal — outputs at time `t` depend only on samples u
 
 | | |
 |---|---|
-| **Input** | 9 channels per timestep: linear acceleration (3-axis), gravity component (3-axis), gyroscope (3-axis) |
+| **Raw input** | 6 channels @ 128 Hz from a lumbar IMU: `ax, ay, az` accelerometer (m/s²) and `gx, gy, gz` gyroscope (rad/s). Matches upstream [Stanford NMBL dataset](https://github.com/stanfordnmbl/imu-fog-detection) (`FREQ_SAMPLED = 128`). |
+| **Preprocess** | Resample 128 → 64 Hz (`FREQ_DESIRED`); 0.3 Hz lowpass split of `acc` into `gravity` and `linear_acc = acc − gravity`. 6 raw → **9 model channels**. |
+| **Model input** | 9 channels per timestep: `linear_acc xyz` (m/s², gravity-removed) + `gravity xyz` (m/s², low-frequency acc) + `gyro xyz` (rad/s). 2-second window = 128 samples @ 64 Hz. |
 | **Output** | Per-window FoG probability → post-processed binary decision for cueing logic |
 | **Phase 1 — Brain** | Train causal TCN with leave-one-subject-out (LOSO) cross-validation |
 | **Phase 2 — Edge** | Compress and export model artifacts for microcontroller-class deployment |
+
+The 6 → 9 expansion is a deterministic DSP split, not augmentation. A 4th-order Butterworth lowpass at 0.3 Hz separates the near-DC gravity component from accelerometer motion: `gravity = lowpass(acc, 0.3 Hz)`, `linear_acc = acc − gravity`. Feeding both to the network is an inductive bias — `gravity` encodes orientation, `linear_acc` encodes gait dynamics — so the network doesn't have to learn the split internally. No information is added; the 3 gravity channels are fully determined by the 3 accel channels.
 
 ---
 
@@ -71,13 +75,13 @@ A causal Temporal Convolutional Network is a strong fit for streaming IMU classi
 
 | Property | Detail |
 |---|---|
-| Receptive field | Large, via dilated convolutions — low compute cost |
+| Receptive field | 61 samples ≈ 0.95 s @ 64 Hz — 4 blocks, channel progression `(32, 64, 96, 128)`, exponential dilations `1/2/4/8` |
 | Causality | Output at step `t` never depends on future samples |
 | Deployment fit | Viable for streaming inference and MCU export |
 
 The backbone is augmented with three streaming-friendly building blocks:
 
-- **Per-timestep Layer Normalization** — replaces BatchNorm so the network is strictly causal and behaves identically at batch size 1 (live inference) and during quantization-aware training.
+- **Per-timestep Layer Normalization** — replaces BatchNorm so the network is strictly causal and behaves identically at batch size 1 (live inference) and during post-training int8 quantization.
 - **Causal Squeeze-and-Excitation Networks** — channel reweighting using a *cumulative* mean across time, so the dense head stays causal.
 - **Deep Networks with Stochastic Depth** on residual branches — regularizes the deep stack without adding inference cost.
 
@@ -139,8 +143,12 @@ Eliminates near-threshold flicker that would otherwise produce unstable cueing b
 HopeGait-FoG_Detection_via_IMU_and_ML/
 ├── Dockerfile
 ├── README.md
+├── pyproject.toml            # Packaging + requires-python (>=3.11)
 ├── requirements.txt          # Training deps
 ├── requirements-edge.txt     # Edge conversion deps (install separately)
+├── config/
+│   └── training_config.yaml  # Editable hyperparameter overrides (optional)
+├── models/                   # Output dir for trained checkpoints + edge artifacts
 ├── scripts/
 │   ├── launch_cloud.sh
 │   └── smoke_train.py
@@ -148,26 +156,44 @@ HopeGait-FoG_Detection_via_IMU_and_ML/
 │   ├── config.py
 │   ├── main.py
 │   ├── data_pipeline/
+│   │   ├── __init__.py
 │   │   ├── dataset.py
 │   │   ├── dsp.py
 │   │   └── preprocess.py
 │   ├── models/
+│   │   ├── __init__.py
 │   │   ├── tcn_model.py
 │   │   └── focal_loss.py
 │   ├── training/
+│   │   ├── __init__.py
 │   │   ├── train.py
 │   │   ├── evaluate.py
 │   │   └── ema.py
 │   ├── inference/
+│   │   ├── __init__.py
 │   │   └── postprocess.py
 │   └── edge_conversion/
+│       ├── __init__.py
 │       └── quantize_model.py
-└── tests/
-    ├── test_dataset.py
-    ├── test_dsp.py
-    ├── test_focal_loss.py
-    ├── test_postprocess.py
-    └── test_tcn_causality.py
+├── tests/
+│   ├── conftest.py
+│   ├── test_agent_schema.py
+│   ├── test_dataset.py
+│   ├── test_dsp.py
+│   ├── test_edge_conversion.py
+│   ├── test_edge_conversion_e2e.py
+│   ├── test_focal_loss.py
+│   ├── test_postprocess.py
+│   └── test_tcn_causality.py
+├── agent/                      # AI Agent workflow — Gemini-orchestrated synthetic-data generator
+│   ├── hopegait_agent.py
+│   ├── synth_signal.py
+│   ├── requirements.txt
+│   └── README.md
+└── .github/workflows/          # CI: tests, training launch, AI Agent
+    ├── ci.yml
+    ├── train.yml
+    └── hopegait_agent.yml
 ```
 
 ---
@@ -188,12 +214,12 @@ git clone https://github.com/stanfordnmbl/imu-fog-detection.git
 data/
 └── raw/
     ├── subject_01/
-    │   └── *.csv      # 100 Hz, 6-axis IMU recordings
+    │   └── *.csv      # 128 Hz, 6-channel IMU recordings (ax, ay, az, gx, gy, gz)
     ├── subject_02/
     └── ...
 ```
 
-The pipeline expects lumbar-mounted IMU recordings at 100 Hz with 6-axis output (3-axis accelerometer + 3-axis gyroscope). Subject subdirectory naming must be consistent — the LOSO split groups by directory name as the subject ID.
+The pipeline expects lumbar-mounted IMU recordings at **128 Hz** with **6 channels**: 3-axis accelerometer (`ax, ay, az` in m/s²) and 3-axis gyroscope (`gx, gy, gz` in rad/s). Preprocessing resamples to 64 Hz and expands the 3 accel channels into `linear_acc + gravity`, so the model sees 9 channels per timestep. Subject subdirectory naming must be consistent — the LOSO split groups by directory name as the subject ID.
 
 **Step 3 — Verify placement before running:**
 
@@ -237,11 +263,16 @@ pip install -r requirements.txt
 # 5. Set PYTHONPATH (required for local runs — src/ is the package root)
 export PYTHONPATH=$(pwd)/src      # Windows: set PYTHONPATH=%cd%\src
 
-# 6. Place dataset (see Section 7), then run
+# 6. (Optional) Copy and edit the YAML config template
+#    config/training_config.yaml ships with the in-code defaults; edit it
+#    to override hyperparameters without touching code. Env vars
+#    (HOPEGAIT_*) override YAML, YAML overrides in-code defaults.
+
+# 7. Place dataset (see Section 7), then run
 python src/main.py
 ```
 
-> **Why install PyTorch first?** `requirements.txt` pins `torch>=2.1` without a wheel URL. Installing PyTorch separately with the correct CUDA index prevents pip from pulling the CPU wheel and silently breaking GPU training.
+> **Why install PyTorch first?** `requirements.txt` pins `torch>=2.0` without a wheel URL. Installing PyTorch separately with the correct CUDA index prevents pip from pulling the CPU wheel and silently breaking GPU training.
 
 ### CLI flags
 
@@ -258,19 +289,34 @@ python src/main.py --force-preprocess
 
 ### Edge conversion (optional)
 
-Only needed when running `edge_conversion/quantize_model.py`. Install on top of the base environment:
+Only needed when running `edge_conversion/quantize_model.py`. Install in a *separate* environment from training (protobuf/TF pins conflict with the PyTorch stack):
 
 ```bash
 pip install -r requirements-edge.txt
 ```
 
-Includes `ai-edge-torch>=0.2.0` (primary path) and the legacy ONNX/TF stack (`tensorflow==2.15.0`, `onnx>=1.15`, `onnx-tf>=1.10`, `protobuf>=3.20.3,<5`). Both targets produce int8 TFLite using the integer-arithmetic-only quantization scheme of [Quantization and Training of Neural Networks for Efficient Integer-Arithmetic-Only Inference](https://arxiv.org/abs/1712.05877). Do not install edge deps into the same environment used for cloud training — protobuf and TF version conflicts will break the PyTorch stack.
+Includes `ai-edge-torch>=0.2.0` (primary path) and the legacy ONNX/TF stack (`tensorflow==2.15.0`, `onnx>=1.15`, `onnx-tf>=1.10`, `protobuf>=3.20.3,<5`). Both targets produce int8 TFLite using the integer-arithmetic-only quantization scheme of [Quantization and Training of Neural Networks for Efficient Integer-Arithmetic-Only Inference](https://arxiv.org/abs/1712.05877).
+
+After a fold has been trained (so `models/hopegait_tcn_best_subj<id>.pth` exists), run the integrated edge step:
+
+```bash
+# Direct invocation
+python src/edge_conversion/quantize_model.py --subject 3 \
+    [--window 128] [--checkpoint <path.pth>] [--output-prefix <models/hopegait>]
+
+# Or via main.py (skips re-training)
+python src/main.py --quantize --subject 3 --skip-train --skip-eval
+```
+
+Outputs land under `models/`: `hopegait.onnx`, `hopegait_int8.tflite`, and `hopegait_model_data.h` (the C byte array consumed by the MCU runtime). The int8 calibration set is drawn from real preprocessed windows when available, falling back to random noise (with a warning) only when no `data/processed/win_<W>/` is present.
 
 ### Smoke test (no GPU, no data required)
 
 ```bash
 python scripts/smoke_train.py
 ```
+
+Expected on the 4-subject synthetic pool: MCC≈0, post-processed sensitivity 0% (2 epochs can't clear the hysteresis high-band). Green when it prints `Smoke test OK.`.
 
 ---
 
@@ -282,7 +328,7 @@ python scripts/smoke_train.py
 bash scripts/launch_cloud.sh
 
 # Override window size
-WINDOW=200 bash scripts/launch_cloud.sh
+WINDOW=128 bash scripts/launch_cloud.sh
 
 # Override subject and epoch count
 SUBJECT=03 EPOCHS=5 bash scripts/launch_cloud.sh
@@ -309,6 +355,10 @@ docker run --rm hopegait:cpu python scripts/smoke_train.py
 ```
 
 `PYTHONPATH=/app/src` is set inside the container by the Dockerfile — no manual export needed in Docker runs.
+
+### AI Agent — synthetic-data generator
+
+`agent/hopegait_agent.py` is a Gemini-orchestrated workflow that produces a small synthetic FoG dataset under `data/synthetic/win_128/`, in the same `.npy` layout `preprocess.py` writes — drop-in for `dataset.py` as a mix-in alongside real Stanford NMBL recordings. Setup, free-tier usage, and the full pipeline are documented in [`agent/README.md`](agent/README.md).
 
 ---
 
@@ -338,9 +388,9 @@ Three operating points reported per fold: fixed-threshold, fold-optimized thresh
 ## 11. Next Steps
 
 - Run full LOSO on cloud GPU and publish final per-subject results table.
-- Complete edge path with robust int8 conversion flow via `ai-edge-torch`.
 - Add streaming parity checks between offline and deployed inference.
 - Benchmark latency, memory footprint, and compute on target MCU.
+- Migrate the edge path from the legacy `onnx → onnx-tf → tensorflow` chain to `ai-edge-torch` once it stabilizes for our op set.
 
 ---
 
@@ -350,7 +400,7 @@ Three operating points reported per fold: fixed-threshold, fold-optimized thresh
 
 - [An Empirical Evaluation of Generic Convolutional and Recurrent Networks for Sequence Modeling](https://arxiv.org/abs/1803.01271) — Bai, Kolter, & Koltun, 2018. TCN architecture with dilated causal convolutions.
 - [Squeeze-and-Excitation Networks](https://arxiv.org/abs/1709.01507) — Hu, Shen, & Sun, *CVPR* 2018. Channel attention; here adapted to a causal cumulative-mean form.
-- [Layer Normalization](https://arxiv.org/abs/1607.06450) — Ba, Kiros, & Hinton, 2016. Per-timestep normalization friendly to streaming inference and batch-1 QAT.
+- [Layer Normalization](https://arxiv.org/abs/1607.06450) — Ba, Kiros, & Hinton, 2016. Per-timestep normalization friendly to streaming inference and batch-1 post-training quantization.
 - [Deep Networks with Stochastic Depth](https://arxiv.org/abs/1603.09382) — Huang, Sun, Liu, Sedra, & Weinberger, *ECCV* 2016. Residual-branch dropout used during training.
 - [Focal Loss for Dense Object Detection](https://arxiv.org/abs/1708.02002) — Lin, Goyal, Girshick, He, & Dollár, *ICCV* 2017. Class-imbalance loss for FoG vs. non-FoG.
 - [Decoupled Weight Decay Regularization](https://arxiv.org/abs/1711.05101) — Loshchilov & Hutter, *ICLR* 2019. AdamW optimizer.

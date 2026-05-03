@@ -22,7 +22,7 @@ class TimeWiseLayerNorm(nn.Module):
         return self.norm(x.transpose(1, 2)).transpose(1, 2)
 
 
-def _gn(channels, max_groups=8):  # name kept for call-site stability
+def _gn(channels):  # name kept for call-site stability after the GroupNorm -> LayerNorm refactor
     return TimeWiseLayerNorm(channels)
 
 
@@ -30,6 +30,13 @@ class Chomp1d(nn.Module):
     # Trims right-side padding so the conv is strictly causal (no future leak).
     def __init__(self, chomp_size):
         super().__init__()
+        # x[:, :, :-0] returns an empty time axis, not the full tensor — guard
+        # against a misconfigured kernel/dilation that would silently break shape.
+        if chomp_size <= 0:
+            raise ValueError(
+                f"Chomp1d requires chomp_size > 0, got {chomp_size}. "
+                "Check that (kernel_size - 1) * dilation > 0."
+            )
         self.chomp_size = chomp_size
 
     def forward(self, x):
@@ -117,8 +124,12 @@ class HopeGaitTCN(nn.Module):
     `forward(x)` returns last-step logits; call `forward_dense(x)` to get both.
     """
 
-    def __init__(self, num_inputs=9, num_channels=(32, 64, 128), kernel_size=3,
+    def __init__(self, num_inputs=9, num_channels=(32, 64, 96, 128), kernel_size=3,
                  num_classes=2, dropout=0.3, drop_path=0.1, use_se=True):
+        # 4 blocks with exponential dilation (1, 2, 4, 8) and kernel_size=3
+        # give a receptive field of 1 + 2*(k-1)*sum(dilations) = 61 samples,
+        # i.e. ~0.95 s at 64 Hz — covers nearly half a 2-second window of
+        # past context, which the previous 3-block (29-sample) stack did not.
         super().__init__()
         # Quant/DeQuant stubs are no-ops in FP32; enabled by QAT in the edge phase.
         self.quant = QuantStub()

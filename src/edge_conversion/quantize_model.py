@@ -1,33 +1,91 @@
-"""PyTorch -> ONNX -> TF -> int8 TFLite -> C header. Edge-phase script."""
+"""PyTorch -> ONNX -> TF -> int8 TFLite -> C header. Edge-phase script.
+
+Reads architecture and window settings from src/config.py so the converted
+graph matches the trained checkpoint exactly. The heavy edge stack
+(``onnx``, ``onnx_tf``, ``tensorflow``) is imported lazily so this module
+can be imported in environments that only have the training deps installed
+(useful for unit-testing the CLI surface).
+
+Usage:
+    python src/edge_conversion/quantize_model.py --subject 3
+    python src/edge_conversion/quantize_model.py --subject 3 --window 128 \\
+        --checkpoint models/hopegait_tcn_best_subj3.pth \\
+        --output-prefix models/hopegait
+"""
 
 import os
 import sys
-import torch
-import onnx
-from onnx_tf.backend import prepare
-import tensorflow as tf
-import numpy as np
+import glob
+import argparse
+
 
 SRC_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
 if SRC_DIR not in sys.path:
     sys.path.append(SRC_DIR)
 
-from config import MODELS_DIR
+import numpy as np
+import torch
+
+from config import (MODELS_DIR, PROCESSED_DATA_DIR, NUM_INPUTS, NUM_CHANNELS,
+                    KERNEL_SIZE, DROPOUT, DROP_PATH, USE_SE, NUM_CLASSES,
+                    WINDOW_SIZES)
 from models.tcn_model import HopeGaitTCN
 
-TARGET_SUBJECT = '3'
-SEQ_LENGTH = 256
-NUM_INPUTS = 11
-PYTORCH_MODEL = os.path.join(MODELS_DIR, f'hopegait_tcn_best_subj{TARGET_SUBJECT}.pth')
-ONNX_MODEL = os.path.join(MODELS_DIR, 'hopegait.onnx')
-TF_MODEL_DIR = os.path.join(MODELS_DIR, 'tf_model')
-TFLITE_MODEL = os.path.join(MODELS_DIR, 'hopegait_int8.tflite')
-CPP_HEADER = os.path.join(MODELS_DIR, 'model_data.h')
+
+_EDGE_DEPS_HINT = (
+    "Edge conversion requires the optional edge stack. Install it with:\n"
+    "    pip install -r requirements-edge.txt\n"
+    "(do this in a separate venv from the training stack — protobuf / TF "
+    "version pins conflict with PyTorch's wheels.)"
+)
 
 
-def representative_data_gen():
-    for _ in range(100):
-        yield [np.random.randn(1, SEQ_LENGTH, NUM_INPUTS).astype(np.float32)]
+def _load_edge_deps():
+    """Import onnx / onnx_tf / tensorflow lazily, with a clear error message."""
+    try:
+        import onnx  # noqa: F401
+        from onnx_tf.backend import prepare  # noqa: F401
+        import tensorflow as tf  # noqa: F401
+    except ImportError as e:
+        sys.stderr.write(f"ERROR: missing edge dependency ({e}).\n{_EDGE_DEPS_HINT}\n")
+        sys.exit(2)
+    return onnx, prepare, tf
+
+
+def representative_data_gen_factory(seq_length, num_inputs, processed_dir):
+    """Return a generator that yields ~100 calibration samples.
+
+    Prefers real preprocessed windows from ``processed_dir/win_<seq_length>/*_x.npy``
+    (so int8 scales reflect actual signal statistics). Falls back to standard
+    normal noise only when no real data is available.
+    """
+    win_dir = os.path.join(processed_dir, f'win_{seq_length}')
+    real_files = sorted(glob.glob(os.path.join(win_dir, '*_x.npy')))
+
+    if real_files:
+        def gen():
+            yielded = 0
+            for path in real_files:
+                arr = np.load(path)
+                if arr.ndim != 3 or arr.shape[1] != seq_length or arr.shape[2] != num_inputs:
+                    continue
+                for i in range(arr.shape[0]):
+                    if yielded >= 100:
+                        return
+                    yield [arr[i:i + 1].astype(np.float32)]
+                    yielded += 1
+        return gen
+
+    sys.stderr.write(
+        f"WARN: no calibration data at {win_dir}; falling back to random noise. "
+        "int8 scales will not reflect real signal statistics.\n"
+    )
+
+    def gen():
+        rng = np.random.default_rng(0)
+        for _ in range(100):
+            yield [rng.standard_normal((1, seq_length, num_inputs)).astype(np.float32)]
+    return gen
 
 
 def convert_to_c_array(tflite_path, header_path):
@@ -49,40 +107,98 @@ const unsigned char hopegait_model_tflite[] = {{
 const unsigned int hopegait_model_tflite_len = {len(tflite_content)};
 #endif
 """
-    os.makedirs(os.path.dirname(header_path), exist_ok=True)
+    os.makedirs(os.path.dirname(header_path) or '.', exist_ok=True)
     with open(header_path, 'w') as f:
         f.write(c_code)
 
 
-def main():
+def parse_args(argv=None):
+    parser = argparse.ArgumentParser(description=__doc__.split('\n\n')[0])
+    parser.add_argument(
+        '--subject', required=True,
+        help='Subject ID whose checkpoint to convert (e.g. "3" or "S03").',
+    )
+    parser.add_argument(
+        '--window', type=int, default=WINDOW_SIZES[0],
+        help=f'Window length in samples (default: {WINDOW_SIZES[0]}).',
+    )
+    parser.add_argument(
+        '--checkpoint', default=None,
+        help='Path to the .pth checkpoint. Defaults to '
+             '<MODELS_DIR>/hopegait_tcn_best_subj<subject>.pth.',
+    )
+    parser.add_argument(
+        '--output-prefix', default=None,
+        help='Output prefix; produces <prefix>.onnx, <prefix>_int8.tflite, '
+             '<prefix>_model_data.h. Defaults to <MODELS_DIR>/hopegait.',
+    )
+    return parser.parse_args(argv)
+
+
+def main(argv=None):
+    args = parse_args(argv)
+
+    checkpoint = args.checkpoint or os.path.join(
+        MODELS_DIR, f'hopegait_tcn_best_subj{args.subject}.pth'
+    )
+    if not os.path.exists(checkpoint):
+        sys.stderr.write(
+            f"ERROR: checkpoint not found at {checkpoint}. Train first or pass "
+            f"--checkpoint explicitly.\n"
+        )
+        sys.exit(1)
+
+    output_prefix = args.output_prefix or os.path.join(MODELS_DIR, 'hopegait')
+    onnx_path = f'{output_prefix}.onnx'
+    tf_dir = f'{output_prefix}_tf'
+    tflite_path = f'{output_prefix}_int8.tflite'
+    header_path = f'{output_prefix}_model_data.h'
+
+    onnx_mod, prepare, tf = _load_edge_deps()
+
     device = torch.device('cpu')
-    model = HopeGaitTCN()
-    model.load_state_dict(torch.load(PYTORCH_MODEL, map_location=device, weights_only=True))
+    model = HopeGaitTCN(
+        num_inputs=NUM_INPUTS,
+        num_channels=tuple(NUM_CHANNELS),
+        kernel_size=KERNEL_SIZE,
+        num_classes=NUM_CLASSES,
+        dropout=DROPOUT,
+        drop_path=DROP_PATH,
+        use_se=USE_SE,
+    )
+    model.load_state_dict(torch.load(checkpoint, map_location=device, weights_only=True))
     model.eval()
 
-    dummy_input = torch.randn(1, SEQ_LENGTH, NUM_INPUTS)
+    os.makedirs(os.path.dirname(onnx_path) or '.', exist_ok=True)
+    dummy_input = torch.randn(1, args.window, NUM_INPUTS)
     torch.onnx.export(
-        model, dummy_input, ONNX_MODEL,
+        model, dummy_input, onnx_path,
         export_params=True, opset_version=13,
         do_constant_folding=True,
         input_names=['input'], output_names=['output'],
     )
+    print(f"Wrote ONNX: {onnx_path}")
 
-    onnx_model = onnx.load(ONNX_MODEL)
-    prepare(onnx_model).export_graph(TF_MODEL_DIR)
+    onnx_model = onnx_mod.load(onnx_path)
+    prepare(onnx_model).export_graph(tf_dir)
+    print(f"Wrote TF SavedModel: {tf_dir}")
 
-    converter = tf.lite.TFLiteConverter.from_saved_model(TF_MODEL_DIR)
+    converter = tf.lite.TFLiteConverter.from_saved_model(tf_dir)
     converter.optimizations = [tf.lite.Optimize.DEFAULT]
-    converter.representative_dataset = representative_data_gen
+    converter.representative_dataset = representative_data_gen_factory(
+        args.window, NUM_INPUTS, PROCESSED_DATA_DIR,
+    )
     converter.target_spec.supported_ops = [tf.lite.OpsSet.TFLITE_BUILTINS_INT8]
     converter.inference_input_type = tf.int8
     converter.inference_output_type = tf.int8
     tflite_model = converter.convert()
 
-    with open(TFLITE_MODEL, 'wb') as f:
+    with open(tflite_path, 'wb') as f:
         f.write(tflite_model)
+    print(f"Wrote int8 TFLite: {tflite_path} ({len(tflite_model)} bytes)")
 
-    convert_to_c_array(TFLITE_MODEL, CPP_HEADER)
+    convert_to_c_array(tflite_path, header_path)
+    print(f"Wrote C header: {header_path}")
 
 
 if __name__ == "__main__":

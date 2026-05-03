@@ -1,0 +1,53 @@
+# HopeGait training configuration template.
+#
+# Resolution order (highest precedence first):
+#   1. HOPEGAIT_* environment variables
+#   2. This YAML file (path overridable via HOPEGAIT_CONFIG_PATH)
+#   3. In-code defaults in src/config.py
+#
+# All keys are optional — anything left unset falls back to the in-code default.
+
+# --- Signal / feature pipeline ---
+raw_sampling_rate: 128.0
+sampling_rate: 64.0
+window_sizes: [128]      # 2 s @ 64 Hz
+window_overlap: 0.5
+
+# --- Model architecture ---
+# 4-block TCN with dilations 1/2/4/8, kernel 3 -> receptive field 61 samples (~0.95 s).
+num_inputs: 9            # linear_acc[3] + gravity[3] + gyro[3]
+num_classes: 2
+num_channels: [32, 64, 96, 128]
+kernel_size: 3
+dropout: 0.3
+
+# --- Training ---
+seed: 42
+batch_size: 64
+epochs: 50
+learning_rate: 0.001
+weight_decay: 0.0001
+class_weights: [0.2, 0.8]
+focal_gamma: 2.0
+early_stop_patience: 10
+lr_patience: 5
+num_workers: 0
+
+# --- Regularization / dense head ---
+drop_path: 0.1
+use_se: true
+dense_loss_weight: 0.5
+ema_decay: 0.999
+
+# --- Augmentation ---
+rotation_max_deg: 15.0
+rotation_prob: 0.5
+
+# --- Inference post-processing ---
+smooth_window: 5
+hysteresis_low: 0.4
+hysteresis_high: 0.6
+
+# --- Cloud / runtime ---
+use_amp: true
+device: auto             # auto | cpu | cuda

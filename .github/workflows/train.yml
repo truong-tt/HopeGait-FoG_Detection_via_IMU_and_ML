@@ -21,7 +21,7 @@ on:
           - ubuntu-latest
           - self-hosted
       window:
-        description: 'Window size to train (e.g. 200). Empty = all configured.'
+        description: 'Window size to train (e.g. 128 = 2 s @ 64 Hz). Empty = all configured.'
         required: false
         default: ''
       epochs:

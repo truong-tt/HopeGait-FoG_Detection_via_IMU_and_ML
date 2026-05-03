@@ -22,7 +22,10 @@ def _warm_lfilter(b, a, data):
 
 
 class IMUFilter:
-    def __init__(self, fs=100.0, lowpass_hz=15.0, gravity_cutoff_hz=0.3, order=4):
+    # Default fs matches the upstream FREQ_DESIRED (post-resample). At 64 Hz
+    # nyquist is 32 Hz, so the 15 Hz lowpass and 0.3 Hz gravity cutoff are
+    # comfortably below it.
+    def __init__(self, fs=64.0, lowpass_hz=15.0, gravity_cutoff_hz=0.3, order=4):
         self.fs = float(fs)
         self.nyq = 0.5 * self.fs
         self.b_lp, self.a_lp = butter(order, lowpass_hz / self.nyq, btype='low')
@@ -54,7 +57,7 @@ class IMUFilter:
         return linear_acc, gravity, gyro_lp, new_ts
 
 
-def freeze_index_window(linear_acc_window, fs=100.0, nperseg=None,
+def freeze_index_window(linear_acc_window, fs=64.0, nperseg=None,
                         loco_band=(0.5, 3.0), freeze_band=(3.0, 8.0)):
     # PSD computed per-axis then summed. DO NOT use ||acc|| first: the magnitude
     # rectifies sinusoids and doubles their apparent frequency, inverting the FI.
@@ -68,7 +71,7 @@ def freeze_index_window(linear_acc_window, fs=100.0, nperseg=None,
     return freeze / (loco + 1e-6)
 
 
-def stft_band_power_window(linear_acc_window, fs=100.0, nperseg=64, band=(3.0, 8.0)):
+def stft_band_power_window(linear_acc_window, fs=64.0, nperseg=64, band=(3.0, 8.0)):
     data = np.asarray(linear_acc_window)
     n = min(nperseg, len(data))
     if n < 8:

@@ -35,14 +35,21 @@ def get_config(env_name, yaml_key, default, parser=None):
 
 
 # --- Signal / feature pipeline ---
-SAMPLING_RATE = get_config('HOPEGAIT_SAMPLING_RATE', 'sampling_rate', 100.0, parser=float)
-WINDOW_SIZES = get_config('HOPEGAIT_WINDOW_SIZES', 'window_sizes', [128, 200, 256, 300], parser=json.loads)
+# Defaults match the upstream stanfordnmbl/imu-fog-detection dataset:
+#   FREQ_SAMPLED = 128 Hz, FREQ_DESIRED = 64 Hz, WINDOW_DUR = 2 s
+# After resampling to FREQ_DESIRED, a 2-second window is 128 samples.
+RAW_SAMPLING_RATE = get_config('HOPEGAIT_RAW_SAMPLING_RATE', 'raw_sampling_rate', 128.0, parser=float)
+SAMPLING_RATE = get_config('HOPEGAIT_SAMPLING_RATE', 'sampling_rate', 64.0, parser=float)
+WINDOW_SIZES = get_config('HOPEGAIT_WINDOW_SIZES', 'window_sizes', [128], parser=json.loads)
 WINDOW_OVERLAP = get_config('HOPEGAIT_WINDOW_OVERLAP', 'window_overlap', 0.5, parser=float)
 
 # --- Model architecture ---
+# 4-block TCN with dilations (1, 2, 4, 8) gives a receptive field of
+#   rf = 1 + 2 * (k-1) * sum(dilations) = 1 + 4 * 15 = 61 samples
+# At 64 Hz that's ~0.95 s — covers nearly half a 2 s window of past context.
 NUM_INPUTS = get_config('HOPEGAIT_NUM_INPUTS', 'num_inputs', 9, parser=int)
 NUM_CLASSES = get_config('HOPEGAIT_NUM_CLASSES', 'num_classes', 2, parser=int)
-NUM_CHANNELS = get_config('HOPEGAIT_NUM_CHANNELS', 'num_channels', [32, 64, 128], parser=json.loads)
+NUM_CHANNELS = get_config('HOPEGAIT_NUM_CHANNELS', 'num_channels', [32, 64, 96, 128], parser=json.loads)
 KERNEL_SIZE = get_config('HOPEGAIT_KERNEL_SIZE', 'kernel_size', 3, parser=int)
 DROPOUT = get_config('HOPEGAIT_DROPOUT', 'dropout', 0.3, parser=float)
 

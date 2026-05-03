@@ -5,6 +5,12 @@ training for 2 epochs and evaluates. Used by CI to catch regressions in the
 data shapes, model, training loop, and post-processing without needing the
 real Stanford dataset.
 
+Expected output: the printed eval summary will report MCC near zero and the
+post-processed sensitivity collapsing to 0%. That is *not* a regression —
+2 epochs on 4 synthetic subjects cannot produce confidence above the
+hysteresis high-band, so the smoother correctly emits zero events. The
+smoke is green if the script reaches "Smoke test OK." without raising.
+
 Run:
     python scripts/smoke_train.py
 """

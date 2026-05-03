@@ -8,7 +8,7 @@
 #
 # Usage:
 #   bash scripts/launch_cloud.sh                # full pipeline, all windows
-#   WINDOW=200 bash scripts/launch_cloud.sh     # one window, faster
+#   WINDOW=128 bash scripts/launch_cloud.sh     # one window (2 s @ 64 Hz canonical)
 #   SUBJECT=03 bash scripts/launch_cloud.sh     # one subject, smoke
 set -euo pipefail
 

@@ -26,10 +26,12 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
 COPY requirements.txt .
-# On the CUDA base image torch is already installed; --no-deps avoids reinstalling
-# the wrong wheel. On the python:3.11-slim base we need to install torch (CPU).
+# Install all training deps. On the CUDA base image torch is already installed;
+# pip will see the existing torch>=2.3 wheel and skip the reinstall, so we do
+# not need --no-deps gymnastics (which silently skips transitive deps and can
+# leave the image broken if the base bumps).
 RUN pip install --upgrade pip && \
-    pip install --no-deps -r requirements.txt || pip install -r requirements.txt
+    pip install -r requirements.txt
 
 COPY . .
 
