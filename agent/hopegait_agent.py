@@ -2,8 +2,9 @@
 
 Uses Gemini to parameterize a deterministic signal synthesizer (`synth_signal.py`),
 producing `.npy` training data in the same layout `preprocess.py` writes — drop-in
-for `dataset.py`. Five paced calls stay inside the free tier (5 RPM / 100 RPD on
-`gemini-2.5-pro`); the LLM never produces raw waveforms. See `agent/README.md`.
+for `dataset.py`. Five paced calls stay inside the free tier on
+`gemini-3-flash-preview` (with `gemini-3.1-flash-lite-preview` as a fallback);
+the LLM never produces raw waveforms. See `agent/README.md`.
 """
 
 from __future__ import annotations
@@ -71,8 +72,8 @@ WINDOW_OVERLAP: float = 0.5
 N_SUBJECTS: int = 20                 # ≈ 2× Stanford NMBL FoG-positive subjects
 SUBJECT_DURATION_S: float = 300.0    # 5 min per subject — keeps prompts under TPM budget
 
-PRIMARY_MODEL: str = "gemini-2.5-pro"
-FALLBACK_MODEL: str = "gemini-2.5-flash"
+PRIMARY_MODEL: str = "gemini-3-flash-preview"
+FALLBACK_MODEL: str = "gemini-3.1-flash-lite-preview"
 MAX_OUTPUT_TOKENS: int = 8192        # large output → more value per request
 MIN_CALL_INTERVAL_S: float = 12.5    # ≤ 5 RPM with safety margin
 
@@ -178,7 +179,7 @@ def _pace(state: RunState) -> None:
 def gemini_call(
     client: genai.Client, prompt: str, label: str, state: RunState
 ) -> GeminiCallResult:
-    """Call Gemini: gemini-2.5-pro × 2 → gemini-2.5-flash fallback, with free-tier pacing."""
+    """Call Gemini: gemini-3-flash-preview × 2 → gemini-3.1-flash-lite-preview fallback, with free-tier pacing."""
     _pace(state)
     log_info(f"-> Gemini call: [yellow]{label}[/yellow]")
     log_info(f"  prompt size: {len(prompt):,} chars (~{len(prompt) // 4:,} tokens)")

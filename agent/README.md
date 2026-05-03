@@ -70,18 +70,24 @@ subjects up alongside any real recordings without code changes.
 
 ## Google AI Studio free-tier usage
 
-| Quota (`gemini-2.5-pro`) | Limit | Used per agent run | Headroom |
-|---|---|---|---|
-| Requests/minute (RPM) | 5 | ≤ 5 (paced at 12.5 s between calls) | 1 RPM |
-| Tokens/minute (TPM) | 250 K | ~30–60 K (chained context per call) | ~190 K |
-| Requests/day (RPD) | 100 | 5 | enough for ~20 runs/day |
+Both `gemini-3-flash-preview` (primary) and `gemini-3.1-flash-lite-preview`
+(fallback) currently expose free tiers in the Gemini API. Google no longer
+publishes static per-model free-tier numbers — live RPM/TPM/RPD for your
+project are shown on the **AI Studio → Rate limits** page, and Google's
+docs note that "specified rate limits are not guaranteed and actual
+capacity may vary." Always confirm there before a fresh run.
+
+The agent makes 5 paced LLM calls per run, which is well inside any
+reasonable preview-tier budget for either model.
 
 Pacing is enforced locally in `gemini_call()`: each call waits until
-`MIN_CALL_INTERVAL_S = 12.5` s have elapsed since the last successful call,
-so a single agent run never bursts past 5 RPM and never earns a 429. If
-`gemini-2.5-pro` returns an `APIError`, the call retries once after 2 s,
-then falls back to `gemini-2.5-flash` (250 RPD), so a transient outage on
-the primary model degrades gracefully rather than killing the run.
+`MIN_CALL_INTERVAL_S = 12.5` s have elapsed since the last successful call
+(i.e. ≤ 5 RPM with margin), so a single agent run never bursts past the
+RPM ceiling and never earns a 429 from request rate alone. If
+`gemini-3-flash-preview` returns an `APIError`, the call retries once
+after 2 s, then falls back to `gemini-3.1-flash-lite-preview`, so a
+transient outage on the primary model degrades gracefully rather than
+killing the run.
 
 `MAX_OUTPUT_TOKENS = 8192` per call keeps responses long enough to be
 useful in chained context for later calls, while staying inside the
@@ -117,8 +123,9 @@ secret**.
 ## Get a free API key
 
 https://aistudio.google.com/apikey — sign in with a Google account. The
-free tier includes `gemini-2.5-pro` (5 RPM / 250 K TPM / 100 RPD) and
-`gemini-2.5-flash` (10 RPM / 250 RPD).
+free tier currently includes `gemini-3-flash-preview` and
+`gemini-3.1-flash-lite-preview`; check the AI Studio rate-limits page for
+the live RPM / TPM / RPD numbers on your project.
 
 ## Dataset spec (matches upstream)
 
